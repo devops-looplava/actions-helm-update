@@ -1,0 +1,227 @@
+name: "Helm Chart Update"
+description: "Update Helm chart values.yaml with new image tag, update cron tags, package and optionally upload to ChartMuseum"
+inputs:
+  HELM_REPO:
+    description: "Helm chart GitHub repository (e.g. onoctave/helm-onoctave)"
+    required: true
+  HELM_TOKEN:
+    description: "GitHub PAT for accessing the Helm chart repository"
+    required: true
+  CHART_DIR:
+    description: "Chart directory name inside the Helm repo"
+    required: false
+    default: "onoctave"
+  REPO:
+    description: "Full GitHub repository of the service (owner/name)"
+    required: true
+  REPO_NAME:
+    description: "Repository short name (auto-derived from REPO if not set)"
+    required: false
+  UPDATED_TAG:
+    description: "New image tag to set in values.yaml"
+    required: true
+  VALUES_FILE:
+    description: "Path to values.yaml relative to CHART_DIR"
+    required: false
+    default: "values.yaml"
+  ECR_ACCOUNT_ID:
+    description: "ECR account ID for cron tag updates (e.g. 888577026587)"
+    required: false
+    default: "888577026587"
+  ECR_REGION:
+    description: "ECR region for cron tag updates"
+    required: false
+    default: "us-west-2"
+  PUSH_CHANGES:
+    description: "Push commits to origin (true/false)"
+    required: false
+    default: "true"
+  UPLOAD_CHART:
+    description: "Package and upload Helm chart to ChartMuseum (true/false)"
+    required: false
+    default: "true"
+  CHARTMUSEUM_URL:
+    description: "ChartMuseum API URL"
+    required: false
+    default: "http://chartmuseum.chartmuseum:8080/api/charts"
+  HELM_CHART_BUCKET:
+    description: "S3 bucket for Helm chart version lookup"
+    required: false
+    default: "onoctave-helm-charts"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Helm repo
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.HELM_REPO }}
+        token: ${{ inputs.HELM_TOKEN }}
+
+    - name: Install yq
+      shell: bash
+      run: |
+        sudo curl -sL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+        sudo chmod +x /usr/local/bin/yq
+
+    - name: Update service tag in values.yaml
+      shell: bash
+      working-directory: ${{ inputs.CHART_DIR }}
+      run: |
+        REPO_NAME="${{ inputs.REPO_NAME }}"
+        if [ -z "$REPO_NAME" ]; then
+          REPO_NAME=$(echo "${{ inputs.REPO }}" | cut -d'/' -f2)
+        fi
+        echo "REPO_NAME: $REPO_NAME"
+
+        # Convert repo name to service name (onoctave-some-service -> someService)
+        SERVICE_NAME=$(echo "$REPO_NAME" | sed 's/^onoctave-//' | sed -r 's/-([a-z])/\U\1/g')
+
+        echo "Repository: $REPO_NAME"
+        echo "Service name in values.yaml: $SERVICE_NAME"
+
+        # Update specific service tag using yq
+        yq eval ".${SERVICE_NAME}.image.tag = \"${{ inputs.UPDATED_TAG }}\"" -i ${{ inputs.VALUES_FILE }}
+
+        # Verify the change
+        echo "Updated tag for ${SERVICE_NAME}:"
+        yq eval ".${SERVICE_NAME}.image.tag" ${{ inputs.VALUES_FILE }}
+
+        echo ""
+        echo "All service tags in values.yaml:"
+        echo "================================================"
+        yq eval '.. | select(has("image")) | .image.tag' ${{ inputs.VALUES_FILE }}
+        echo "================================================"
+
+        echo ""
+        echo "Service tags breakdown:"
+        echo "================================================"
+        yq eval 'to_entries | .[] | select(.value | has("image")) | .key + ": " + .value.image.tag' ${{ inputs.VALUES_FILE }}
+        echo "================================================"
+
+    - name: Update cron tags
+      shell: bash
+      working-directory: ${{ inputs.CHART_DIR }}
+      run: |
+        REPO_NAME="${{ inputs.REPO_NAME }}"
+        if [ -z "$REPO_NAME" ]; then
+          REPO_NAME=$(echo "${{ inputs.REPO }}" | cut -d'/' -f2)
+        fi
+        FILE="${{ inputs.VALUES_FILE }}"
+        UPDATED_TAG="${{ inputs.UPDATED_TAG }}"
+
+        if [ ! -f "$FILE" ]; then
+          echo "File $FILE not found, skipping cron tag update"
+          exit 0
+        fi
+
+        cp "$FILE" "${FILE}.backup"
+
+        awk -v sha="$UPDATED_TAG" -v repo="$REPO_NAME" '
+        $0 ~ "repository: ${{ inputs.ECR_ACCOUNT_ID }}\\.dkr\\.ecr\\.${{ inputs.ECR_REGION }}\\.amazonaws\\.com/" repo {
+            print
+            getline
+            if ($0 ~ /tag:/) {
+                match($0, /^[[:space:]]*/)
+                indent = substr($0, RSTART, RLENGTH)
+                print indent "tag: " sha
+                next
+            }
+        }
+        {print}
+        ' "$FILE" > "${FILE}.tmp" && mv "${FILE}.tmp" "$FILE"
+
+        echo "Updated cron tags for $REPO_NAME"
+
+    - name: Commit and push changes
+      shell: bash
+      working-directory: ${{ inputs.CHART_DIR }}
+      run: |
+        REPO_NAME="${{ inputs.REPO_NAME }}"
+        if [ -z "$REPO_NAME" ]; then
+          REPO_NAME=$(echo "${{ inputs.REPO }}" | cut -d'/' -f2)
+        fi
+        SERVICE_NAME=$(echo "$REPO_NAME" | sed 's/^onoctave-//' | sed -r 's/-([a-z])/\U\1/g')
+        UPDATED_TAG="${{ inputs.UPDATED_TAG }}"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git remote set-url origin https://x-access-token:${{ inputs.HELM_TOKEN }}@github.com/${{ inputs.HELM_REPO }}.git
+
+        if git diff --quiet ${{ inputs.VALUES_FILE }}; then
+          echo "No changes to commit"
+          exit 0
+        fi
+
+        git add ${{ inputs.VALUES_FILE }}
+        git commit -m "chore: update $SERVICE_NAME image tag to $UPDATED_TAG" || true
+
+        if [ "${{ inputs.PUSH_CHANGES }}" = "true" ]; then
+          git push origin HEAD || true
+          echo "Changes pushed successfully"
+        else
+          echo "Push disabled, skipping"
+        fi
+
+    - name: Install Helm
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+    - name: Configure AWS CLI
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: aws configure set region ${{ inputs.ECR_REGION }}
+
+    - name: Calculate next chart version
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      id: calc-version
+      shell: bash
+      run: |
+        BUCKET="${{ inputs.HELM_CHART_BUCKET }}"
+        CHART_NAME="${{ inputs.CHART_DIR }}"
+
+        versions=$(aws s3 ls s3://$BUCKET/ | grep "${CHART_NAME}-" \
+          | sed -E "s/.*${CHART_NAME}-([0-9]+\.[0-9]+\.[0-9]+)\.tgz/\1/" | sort -V)
+
+        latest=$(echo "$versions" | tail -n1)
+        if [ -z "$latest" ]; then
+          new_version="0.1.0"
+        else
+          major=$(echo "$latest" | cut -d. -f1)
+          minor=$(echo "$latest" | cut -d. -f2)
+          patch=$(echo "$latest" | cut -d. -f3)
+          new_patch=$((patch + 1))
+          new_version="${major}.${minor}.${new_patch}"
+        fi
+
+        echo "Next version: $new_version"
+        echo "version=$new_version" >> $GITHUB_OUTPUT
+
+    - name: Update Chart.yaml version
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: |
+        sed -i "s/^version:.*/version: ${{ steps.calc-version.outputs.version }}/" ${{ inputs.CHART_DIR }}/Chart.yaml
+        grep version ${{ inputs.CHART_DIR }}/Chart.yaml
+
+    - name: Package Helm chart
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: |
+        mkdir -p packaged
+        helm package ${{ inputs.CHART_DIR }} --destination ./packaged
+        ls -l ./packaged
+
+    - name: Upload Helm chart to ChartMuseum
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: |
+        CHART_FILE=$(ls packaged/*.tgz)
+        echo "Uploading $CHART_FILE to ChartMuseum..."
+        curl -sS --fail -X POST --data-binary @"$CHART_FILE" ${{ inputs.CHARTMUSEUM_URL }}
+
+    - name: Verify ChartMuseum upload
+      if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: curl -s ${{ inputs.CHARTMUSEUM_URL }} | jq
