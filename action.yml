@@ -249,11 +249,46 @@ runs:
         FILE="${{ inputs.VALUES_FILE }}"
         ECR_PREFIX="${{ inputs.ECR_ACCOUNT_ID }}.dkr.ecr.${{ inputs.ECR_REGION }}.amazonaws.com/${REPO_NAME}"
 
-        echo "Replacing tag in image name for ${REPO_NAME}"
+        echo "=== Debug: Second chart update ==="
+        echo "REPO_NAME: ${REPO_NAME}"
+        echo "FILE: ${FILE}"
+        echo "ECR_PREFIX: ${ECR_PREFIX}"
+        echo "UPDATED_TAG: ${{ inputs.UPDATED_TAG }}"
+        echo "Working directory: $(pwd)"
+        echo ""
+
+        if [ ! -f "$FILE" ]; then
+          echo "ERROR: File '$FILE' not found in $(pwd)"
+          echo "Available files:"
+          ls -la
+          exit 1
+        fi
+
+        echo "=== File content before update ==="
+        cat "$FILE"
+        echo ""
+
+        echo "=== Searching for pattern: name: ${ECR_PREFIX}:.* ==="
+        if grep -n "${ECR_PREFIX}" "$FILE"; then
+          echo "Found ECR_PREFIX in file, applying sed replacement"
+        else
+          echo "WARNING: Pattern '${ECR_PREFIX}' not found in $FILE"
+          echo "This may mean the second chart uses a different image reference format"
+        fi
+
         sed -i "s|name: ${ECR_PREFIX}:.*|name: ${ECR_PREFIX}:${{ inputs.UPDATED_TAG }}|g" "$FILE"
 
-        echo "Updated image name:"
-        grep "${ECR_PREFIX}" "$FILE"
+        echo ""
+        echo "=== File content after update ==="
+        cat "$FILE"
+        echo ""
+
+        echo "=== Verifying update ==="
+        if grep -n "${ECR_PREFIX}" "$FILE"; then
+          echo "Image reference updated successfully"
+        else
+          echo "WARNING: ECR_PREFIX '${ECR_PREFIX}' still not found after update — the image may be referenced differently in this chart"
+        fi
 
     - name: Commit and push second chart
       if: ${{ inputs.HELM_REPO_2 != '' }}
