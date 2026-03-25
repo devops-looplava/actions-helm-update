@@ -48,6 +48,9 @@ inputs:
     description: "S3 bucket for Helm chart version lookup"
     required: false
     default: "onoctave-helm-charts"
+  HELM_REPO_2:
+    description: "Second Helm chart GitHub repository (e.g. onoctave/helm2-onoctave)"
+    required: false
 
 runs:
   using: "composite"
@@ -223,5 +226,91 @@ runs:
 
     - name: Verify ChartMuseum upload
       if: ${{ inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: curl -s ${{ inputs.CHARTMUSEUM_URL }} | jq
+
+    # ── Second Helm chart (HELM_REPO_2) ──
+    - name: Checkout second Helm repo
+      if: ${{ inputs.HELM_REPO_2 != '' }}
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.HELM_REPO_2 }}
+        token: ${{ inputs.HELM_TOKEN }}
+
+    - name: Update service image name in second chart
+      if: ${{ inputs.HELM_REPO_2 != '' }}
+      shell: bash
+      working-directory: ${{ inputs.CHART_DIR }}
+      run: |
+        REPO_NAME="${{ inputs.REPO_NAME }}"
+        if [ -z "$REPO_NAME" ]; then
+          REPO_NAME=$(echo "${{ inputs.REPO }}" | cut -d'/' -f2)
+        fi
+        FILE="${{ inputs.VALUES_FILE }}"
+        ECR_PREFIX="${{ inputs.ECR_ACCOUNT_ID }}.dkr.ecr.${{ inputs.ECR_REGION }}.amazonaws.com/${REPO_NAME}"
+
+        echo "Replacing tag in image name for ${REPO_NAME}"
+        sed -i "s|name: ${ECR_PREFIX}:.*|name: ${ECR_PREFIX}:${{ inputs.UPDATED_TAG }}|g" "$FILE"
+
+        echo "Updated image name:"
+        grep "${ECR_PREFIX}" "$FILE"
+
+    - name: Commit and push second chart
+      if: ${{ inputs.HELM_REPO_2 != '' }}
+      shell: bash
+      working-directory: ${{ inputs.CHART_DIR }}
+      run: |
+        REPO_NAME="${{ inputs.REPO_NAME }}"
+        if [ -z "$REPO_NAME" ]; then
+          REPO_NAME=$(echo "${{ inputs.REPO }}" | cut -d'/' -f2)
+        fi
+        SERVICE_NAME=$(echo "$REPO_NAME" | sed 's/^onoctave-//' | sed -r 's/-([a-z])/\U\1/g')
+        UPDATED_TAG="${{ inputs.UPDATED_TAG }}"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git remote set-url origin https://x-access-token:${{ inputs.HELM_TOKEN }}@github.com/${{ inputs.HELM_REPO_2 }}.git
+
+        if git diff --quiet ${{ inputs.VALUES_FILE }}; then
+          echo "No changes to commit"
+          exit 0
+        fi
+
+        git add ${{ inputs.VALUES_FILE }}
+        git commit -m "chore: update $SERVICE_NAME image tag to $UPDATED_TAG" || true
+
+        if [ "${{ inputs.PUSH_CHANGES }}" = "true" ]; then
+          git push origin HEAD || true
+          echo "Changes pushed successfully"
+        else
+          echo "Push disabled, skipping"
+        fi
+
+    - name: Update second Chart.yaml version
+      if: ${{ inputs.HELM_REPO_2 != '' && inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: |
+        sed -i "s/^version:.*/version: ${{ steps.calc-version.outputs.version }}/" ${{ inputs.CHART_DIR }}/Chart.yaml
+        grep version ${{ inputs.CHART_DIR }}/Chart.yaml
+
+    - name: Package second Helm chart
+      if: ${{ inputs.HELM_REPO_2 != '' && inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: |
+        rm -rf packaged
+        mkdir -p packaged
+        helm package ${{ inputs.CHART_DIR }} --destination ./packaged
+        ls -l ./packaged
+
+    - name: Upload second Helm chart to ChartMuseum
+      if: ${{ inputs.HELM_REPO_2 != '' && inputs.UPLOAD_CHART == 'true' }}
+      shell: bash
+      run: |
+        CHART_FILE=$(ls packaged/*.tgz)
+        echo "Uploading $CHART_FILE to ChartMuseum..."
+        curl -sS --fail -X POST --data-binary @"$CHART_FILE" ${{ inputs.CHARTMUSEUM_URL }}
+
+    - name: Verify second chart ChartMuseum upload
+      if: ${{ inputs.HELM_REPO_2 != '' && inputs.UPLOAD_CHART == 'true' }}
       shell: bash
       run: curl -s ${{ inputs.CHARTMUSEUM_URL }} | jq
